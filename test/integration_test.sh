@@ -25,6 +25,18 @@ PG_DSN="${TEST_PG_DSN:-postgres://postgres:postgres@127.0.0.1:5432/orbitcp?sslmo
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
+# setsid (util-linux) isn't available on macOS by default. We only need
+# "run in the background, detached enough to survive this script," so
+# fall back to plain backgrounding there -- functionally fine for this
+# test's purposes on either platform.
+run_bg() {
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$@" &
+  else
+    "$@" &
+  fi
+}
+
 cleanup() {
   for pid in "${PIDS[@]:-}"; do kill -9 "$pid" >/dev/null 2>&1 || true; done
 }
@@ -32,6 +44,14 @@ trap cleanup EXIT
 
 echo "==> Building test binary"
 GOFLAGS=-mod=mod GOPROXY=off go build -o "$BIN" . || { echo "build failed"; exit 1; }
+
+# Best-effort cleanup of any state left behind by a PREVIOUS run of this
+# same test (it reuses the same node IDs/ports every time). Harmless no-op
+# if psql isn't available or the tables don't exist yet.
+if command -v psql >/dev/null 2>&1; then
+  psql "$PG_DSN" -c "DELETE FROM raft_log WHERE node_id LIKE '127.0.0.1:94%'" >/dev/null 2>&1 || true
+  psql "$PG_DSN" -c "DELETE FROM raft_meta WHERE node_id LIKE '127.0.0.1:94%'" >/dev/null 2>&1 || true
+fi
 
 echo "==> Starting 5-node control plane on ports: ${PORTS[*]} (PG_DSN=$PG_DSN)"
 CLUSTER=""
@@ -41,7 +61,7 @@ CLUSTER="${CLUSTER%,}"
 PIDS=()
 for p in "${PORTS[@]}"; do
   NODE_ID="127.0.0.1:${p}" PORT="$p" CLUSTER="$CLUSTER" PG_DSN="$PG_DSN" \
-    setsid "$BIN" > "/tmp/orbitcp-itest-${p}.log" 2>&1 < /dev/null &
+    run_bg "$BIN" > "/tmp/orbitcp-itest-${p}.log" 2>&1 < /dev/null
   PIDS+=($!)
   sleep 0.3
 done
@@ -166,7 +186,7 @@ kill -9 "$FOLLOWER2_PID"
 echo "    killed follower on port ${FOLLOWER2_PORT} (pid ${FOLLOWER2_PID}) -- all its in-memory state is gone"
 
 NODE_ID="127.0.0.1:${FOLLOWER2_PORT}" PORT="$FOLLOWER2_PORT" CLUSTER="$CLUSTER" PG_DSN="$PG_DSN" \
-  setsid "$BIN" > "/tmp/orbitcp-itest-${FOLLOWER2_PORT}-restart.log" 2>&1 < /dev/null &
+  run_bg "$BIN" > "/tmp/orbitcp-itest-${FOLLOWER2_PORT}-restart.log" 2>&1 < /dev/null
 RESTARTED_PID=$!
 PIDS+=("$RESTARTED_PID")
 

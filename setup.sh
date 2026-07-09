@@ -47,9 +47,26 @@ need docker
 need kind
 need kubectl
 need go
-c_green "All dependencies present."
+if ! docker info >/dev/null 2>&1; then
+  c_red "The Docker CLI is installed, but the Docker daemon isn't running/reachable."
+  c_red "On Mac: open Docker Desktop and wait for it to fully start, then re-run this script."
+  exit 1
+fi
+c_green "All dependencies present, Docker daemon is running."
 
-c_yellow "==> [2/8] Running unit test suite (go vet + go test -race)"
+c_yellow "==> [2/8] Spinning up a throwaway Postgres container for tests"
+docker rm -f orbitcp-test-postgres >/dev/null 2>&1 || true
+docker run -d --name orbitcp-test-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=orbitcp -p 55432:5432 postgres:16-alpine >/dev/null
+trap 'docker rm -f orbitcp-test-postgres >/dev/null 2>&1 || true' EXIT
+TEST_PG_DSN="postgres://postgres:postgres@127.0.0.1:55432/orbitcp?sslmode=disable"
+c_yellow "    waiting for Postgres to accept connections..."
+for i in $(seq 1 20); do
+  docker exec orbitcp-test-postgres pg_isready -U postgres >/dev/null 2>&1 && break
+  sleep 1
+done
+c_green "Postgres ready on 127.0.0.1:55432."
+
+c_yellow "==> [3/8] Running unit test suite (go vet + go test -race, with Postgres persistence coverage)"
 UNFORMATTED=$(gofmt -l . | grep -v third_party || true)
 if [ -n "$UNFORMATTED" ]; then
   c_red "gofmt found unformatted files:"
@@ -58,26 +75,15 @@ if [ -n "$UNFORMATTED" ]; then
   exit 1
 fi
 GOFLAGS=-mod=mod GOPROXY=off go vet ./...
-if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
-  c_yellow "    (spinning up a throwaway Postgres container for persistence tests)"
-  docker rm -f orbitcp-test-postgres >/dev/null 2>&1 || true
-  docker run -d --name orbitcp-test-postgres -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=orbitcp -p 55432:5432 postgres:16-alpine >/dev/null
-  trap 'docker rm -f orbitcp-test-postgres >/dev/null 2>&1 || true' EXIT
-  sleep 3
-  TEST_PG_DSN="postgres://postgres:postgres@127.0.0.1:55432/orbitcp?sslmode=disable" \
-    GOFLAGS=-mod=mod GOPROXY=off go test ./... -race -cover
-else
-  c_yellow "    docker not available for a test Postgres -- running tests without persistence coverage"
-  GOFLAGS=-mod=mod GOPROXY=off go test ./... -race -cover
-fi
+TEST_PG_DSN="$TEST_PG_DSN" GOFLAGS=-mod=mod GOPROXY=off go test ./... -race -cover
 c_green "Unit tests passed."
 
-c_yellow "==> [3/8] Running integration test against a real 5-node local cluster + Postgres"
+c_yellow "==> [4/8] Running integration test against a real 5-node local cluster + Postgres"
 c_yellow "    (leader election, reconciler orchestration, chaos/failover, crash-recovery)"
-TEST_PG_DSN="postgres://postgres:postgres@127.0.0.1:55432/orbitcp?sslmode=disable" bash test/integration_test.sh
+TEST_PG_DSN="$TEST_PG_DSN" bash test/integration_test.sh
 c_green "Integration tests passed."
 
-c_yellow "==> [4/8] Creating kind cluster '${CLUSTER_NAME}' (skipped if it already exists)"
+c_yellow "==> [5/8] Creating kind cluster '${CLUSTER_NAME}' (skipped if it already exists)"
 if ! kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}\$"; then
   kind create cluster --name "${CLUSTER_NAME}"
 else
@@ -85,13 +91,26 @@ else
 fi
 kubectl cluster-info --context "kind-${CLUSTER_NAME}"
 
-c_yellow "==> [5/8] Building and loading Docker image ${IMAGE_NAME}"
+c_yellow "==> [6/8] Building and loading Docker image ${IMAGE_NAME}"
 docker build -t "${IMAGE_NAME}" .
-kind load docker-image "${IMAGE_NAME}" --name "${CLUSTER_NAME}"
+# 'kind load docker-image' can fail on images carrying attestation/
+# provenance manifests with a "content digest ... not found" error (a
+# known kind/Docker Desktop interaction, common on Apple Silicon).
+# Saving to a tarball first and loading THAT avoids it reliably for our
+# own locally-built image.
+docker save "${IMAGE_NAME}" -o /tmp/orbitcp-image.tar
+kind load image-archive /tmp/orbitcp-image.tar --name "${CLUSTER_NAME}"
+rm -f /tmp/orbitcp-image.tar
 
-c_yellow "==> [6/8] Also pre-pulling and loading postgres:16-alpine into kind"
-docker pull postgres:16-alpine
-kind load docker-image postgres:16-alpine --name "${CLUSTER_NAME}"
+# postgres:16-alpine is a PUBLIC image already on Docker Hub -- unlike our
+# own image, it doesn't need to be side-loaded into kind at all. Kubernetes'
+# default imagePullPolicy (IfNotPresent, since the tag isn't "latest") means
+# the kind node's own containerd will just pull it directly from Docker Hub
+# the first time the Postgres pod schedules. Pre-loading it was needless
+# extra work AND the thing actually triggering the attestation-manifest bug
+# (Hub-pulled multi-arch images carry heavier attestation metadata than a
+# locally-built single-arch one) -- removing the step fixes the failure by
+# not needing the workaround in the first place.
 
 c_yellow "==> [7/8] Applying Kubernetes manifests (Postgres + 5-node StatefulSet + PDB)"
 kubectl apply -f k8s.yaml
