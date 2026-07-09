@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Lint, unit tests, integration tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: orbitcp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_PG_DSN: postgres://postgres:postgres@localhost:5432/orbitcp?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Check formatting (gofmt)
+        run: |
+          UNFORMATTED=$(gofmt -l . | grep -v third_party || true)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files are not gofmt'd:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: go vet
+        run: GOFLAGS=-mod=mod GOPROXY=off go vet ./...
+
+      - name: Unit tests (race detector + coverage, incl. Postgres persistence tests)
+        run: GOFLAGS=-mod=mod GOPROXY=off go test ./... -race -cover -v
+
+      - name: Build binary
+        run: GOFLAGS=-mod=mod GOPROXY=off go build -o bin/orbitcp .
+
+      - name: Integration test (real 5-node cluster + real Postgres, chaos/failover + crash-recovery)
+        run: bash test/integration_test.sh
+
+  docker:
+    name: Docker image build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t orbitcp:ci .
+
+  k8s-manifests:
+    name: Validate Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+      - name: Validate k8s.yaml
+        run: kubeconform -strict -summary k8s.yaml
