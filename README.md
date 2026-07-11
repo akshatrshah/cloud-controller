@@ -115,15 +115,19 @@ library:
 | `persistence.go` | Postgres-backed durable storage for Raft's term/vote/log/commit index |
 | `store.go` | The replicated state machine: resource lifecycle registry + transition table |
 | `resource.go` | `ResourceManager` (API-driven ops) + `Reconciler` (autonomous orchestration loop) |
+| `metrics.go` | Prometheus metrics exporter (hand-rolled exposition format, zero dependencies) |
 | `api.go` | Client-facing HTTP API |
 | `raft_test.go` | Unit tests for consensus safety properties |
 | `store_test.go` | Unit tests for the resource state machine and transition table |
 | `resource_test.go` | Unit tests for `ResourceManager` and the reconciler |
+| `metrics_test.go` | Unit tests for the metrics exporter |
 | `persistence_test.go` | Unit tests for Postgres storage + full crash-recovery scenario |
 | `test/integration_test.sh` | Real 5-node + real-Postgres network integration + chaos test |
 | `third_party/pq/` | Vendored copy of `github.com/lib/pq` (see note below) |
 | `Dockerfile` | Multi-stage build → minimal Alpine runtime image (pure Go, no cgo) |
 | `k8s.yaml` | Namespace, Postgres StatefulSet, headless/client Services, PDB, 5-node StatefulSet |
+| `k8s-monitoring.yaml` | Prometheus + Grafana, pre-provisioned dashboard, scrapes all 5 pods |
+| `terraform/` | Terraform equivalent of both YAML manifests, using the `kubernetes` provider |
 | `setup.sh` | One-command pipeline: test → build → deploy → smoke test |
 | `Makefile` | `make test`, `make deploy`, etc. |
 | `.github/workflows/ci.yml` | CI with a live Postgres service container, every push |
@@ -191,6 +195,49 @@ curl http://localhost:8080/status
 
 `kind` must be one of `compute`, `network`, `storage`. Writes against a non-leader
 return `HTTP 421` with `{"error":"not leader","leader_id":"..."}`.
+
+---
+
+## Observability
+
+Every node exposes `/metrics` in standard Prometheus exposition format — written
+by hand (`metrics.go`) rather than pulling in `prometheus/client_golang`, for the
+same reason the consensus engine is hand-built: understanding the actual protocol
+rather than just calling a library that hides it. Prometheus itself doesn't care
+either way — it's plain text over HTTP.
+
+Tracked per node: current Raft term, leader status (0/1), commit index, log
+length, quorum size; counters for elections started/won and proposals
+succeeded/failed; and a live gauge of resource counts by lifecycle state.
+
+`./setup.sh` deploys Prometheus (scraping all 5 pods every 5s) and Grafana
+(pre-provisioned with a dashboard, no manual setup) alongside the control plane.
+The dashboard's most useful panel is "Current Leader" as a time series — a
+`kubectl delete pod` on the leader shows up as a visible line jumping to a
+different pod within seconds, which is a much more convincing way to see
+failover happen than reading terminal output.
+
+```bash
+curl http://localhost:8080/metrics       # raw text, any single node
+open http://localhost:9090               # Prometheus UI (PromQL queries)
+open http://localhost:3000               # Grafana (admin / orbitcp-demo)
+```
+
+## Infrastructure as Code (Terraform)
+
+`terraform/` is a Terraform equivalent of `k8s.yaml` + `k8s-monitoring.yaml`,
+using the `kubernetes` provider — same resources, applied through
+`terraform apply` instead of `kubectl apply -f`. Kubernetes itself doesn't
+change; this is a different way of telling the same API server what you want,
+with the usual Terraform benefits (plan/diff before changes land, tracked
+state, clean `terraform destroy`).
+
+It's a genuine, not cosmetic, difference from the raw YAML: replica count,
+image tag, and whether monitoring deploys at all are all `terraform.tfvars`
+inputs rather than requiring hand-edits to a YAML file (see `terraform/README.md`
+for the full variable list). Both deployment paths are kept — `k8s.yaml`
+remains the simple documented default in `./setup.sh`, and `terraform/` is
+there for anyone who wants to see the IaC version or use it directly.
 
 ---
 
@@ -285,10 +332,10 @@ what this kind of role asks for:
   overhead than a real deployment would want at scale.
 - **Simulated provisioning** — the reconciler's `PROVISIONING → RUNNING` transition
   is time-based (a fixed delay), standing in for what would be a real call to a
-  hypervisor/cloud-provider/Terraform-style API in production.
-- **No metrics endpoint** — `/status` is enough for a demo; a real deployment would
-  want Prometheus counters for term changes, election frequency, reconcile latency,
-  and provisioning success/failure rates.
+  hypervisor or cloud-provider API in production.
+- **Metrics retention is short** (`--storage.tsdb.retention.time=6h` in
+  `k8s-monitoring.yaml`) since this is a demo cluster, not meant to retain
+  long-term history — see "Observability" below for what's actually collected.
 - **No multi-region topology** — this is a single Raft group; a real multi-region
   control plane would likely shard by region with per-region quorums, and use a
   higher-level coordination layer across regions rather than one global Raft group
