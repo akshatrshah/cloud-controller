@@ -108,9 +108,18 @@ fi
 
 echo "==> Test: resource state replicated to ALL 5 nodes"
 REPLICATED=0
-for p in "${PORTS[@]}"; do
-  STATE=$(curl -s --max-time 1 "http://127.0.0.1:${p}/resources/${RES_ID}" | grep -o '"state":"[A-Z]*"' | cut -d'"' -f4)
-  [[ "$STATE" == "RUNNING" ]] && REPLICATED=$((REPLICATED+1))
+for i in $(seq 1 10); do
+  REPLICATED=0
+  for p in "${PORTS[@]}"; do
+    STATE=$(curl -s --max-time 1 "http://127.0.0.1:${p}/resources/${RES_ID}" | grep -o '"state":"[A-Z]*"' | cut -d'"' -f4)
+    [[ "$STATE" == "RUNNING" ]] && REPLICATED=$((REPLICATED+1))
+  done
+  [[ "$REPLICATED" -eq 5 ]] && break
+  # Followers apply committed entries via their own async loop reacting to
+  # the leader's heartbeat -- normally sub-second, but not synchronous
+  # with the leader itself showing RUNNING. Give it a moment to converge
+  # instead of checking exactly once.
+  sleep 0.3
 done
 if [[ "$REPLICATED" -eq 5 ]]; then
   pass "resource state replicated to all 5/5 nodes"
@@ -190,11 +199,18 @@ NODE_ID="127.0.0.1:${FOLLOWER2_PORT}" PORT="$FOLLOWER2_PORT" CLUSTER="$CLUSTER" 
 RESTARTED_PID=$!
 PIDS+=("$RESTARTED_PID")
 
-# Deliberately tiny sleep: we want to catch it before it's plausibly had
-# time for a normal AppendEntries-based resync, to prove the recovery
-# came from Postgres, not the cluster.
-sleep 0.3
-RECOVERED_STATE=$(curl -s --max-time 1 "http://127.0.0.1:${FOLLOWER2_PORT}/resources/${RES_ID}" | grep -o '"state":"[A-Z]*"' | cut -d'"' -f4)
+# We want to catch this close to instantly, to prove the recovery came
+# from Postgres rather than a normal cluster resync -- but a single fixed
+# sleep left zero margin for system load (e.g. Docker Desktop + a live
+# kind cluster also competing for CPU on a dev machine), which could mean
+# checking before the restarted process has even finished Go runtime
+# startup. Poll briefly instead of a single fixed-delay check.
+RECOVERED_STATE=""
+for i in $(seq 1 20); do
+  RECOVERED_STATE=$(curl -s --max-time 1 "http://127.0.0.1:${FOLLOWER2_PORT}/resources/${RES_ID}" 2>/dev/null | grep -o '"state":"[A-Z]*"' | cut -d'"' -f4)
+  [[ "$RECOVERED_STATE" == "RUNNING" ]] && break
+  sleep 0.1
+done
 if [[ "$RECOVERED_STATE" == "RUNNING" ]]; then
   pass "restarted node recovered committed resource state (RUNNING) from Postgres almost instantly"
 else
