@@ -1,0 +1,242 @@
+# --- Prometheus: scrapes /metrics from every control-plane pod every 5s ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: orbitcp
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+    scrape_configs:
+      # Static list of the 5 known StatefulSet pod DNS names. A larger
+      # deployment would use Kubernetes service discovery
+      # (kubernetes_sd_configs) instead of a static list, but for a fixed
+      # 5-node demo cluster, static targets are simpler and just as
+      # correct -- no need for the extra RBAC + discovery complexity a
+      # portfolio-scale project doesn't need.
+      - job_name: 'orbitcp'
+        static_configs:
+          - targets:
+              - 'raft-0.raft-headless:8080'
+              - 'raft-1.raft-headless:8080'
+              - 'raft-2.raft-headless:8080'
+              - 'raft-3.raft-headless:8080'
+              - 'raft-4.raft-headless:8080'
+        metrics_path: /metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: orbitcp
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: orbitcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.53.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.retention.time=6h # demo cluster, not meant to retain long-term history
+          ports:
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+---
+# --- Grafana: pre-provisioned with a Prometheus datasource + one dashboard ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: orbitcp
+data:
+  datasource.yml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provisioning
+  namespace: orbitcp
+data:
+  dashboards.yml: |
+    apiVersion: 1
+    providers:
+      - name: orbitcp
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-orbitcp
+  namespace: orbitcp
+data:
+  orbitcp.json: |
+    {
+      "title": "Orbit Control Plane",
+      "timezone": "browser",
+      "refresh": "5s",
+      "time": { "from": "now-15m", "to": "now" },
+      "panels": [
+        {
+          "id": 1,
+          "title": "Current Leader (1 = leader, 0 = follower, per pod)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 0 },
+          "targets": [
+            { "expr": "orbitcp_raft_is_leader", "legendFormat": "{{instance}}" }
+          ]
+        },
+        {
+          "id": 2,
+          "title": "Raft Term (per pod)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+          "targets": [
+            { "expr": "orbitcp_raft_term", "legendFormat": "{{instance}}" }
+          ]
+        },
+        {
+          "id": 3,
+          "title": "Commit Index (per pod)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+          "targets": [
+            { "expr": "orbitcp_raft_commit_index", "legendFormat": "{{instance}}" }
+          ]
+        },
+        {
+          "id": 4,
+          "title": "Resources by Lifecycle State",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+          "targets": [
+            { "expr": "max by (state) (orbitcp_resources_by_state)", "legendFormat": "{{state}}" }
+          ]
+        },
+        {
+          "id": 5,
+          "title": "Elections Started vs Won (rate, per pod)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+          "targets": [
+            { "expr": "rate(orbitcp_elections_started_total[5m])", "legendFormat": "started {{instance}}" },
+            { "expr": "rate(orbitcp_elections_won_total[5m])", "legendFormat": "won {{instance}}" }
+          ]
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-admin
+  namespace: orbitcp
+type: Opaque
+stringData:
+  GF_SECURITY_ADMIN_PASSWORD: orbitcp-demo
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: orbitcp
+spec:
+  selector:
+    app: grafana
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: orbitcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.1.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: admin
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: GF_SECURITY_ADMIN_PASSWORD
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provisioning
+              mountPath: /etc/grafana/provisioning/dashboards
+            - name: dashboard-json
+              mountPath: /var/lib/grafana/dashboards
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provisioning
+          configMap:
+            name: grafana-dashboard-provisioning
+        - name: dashboard-json
+          configMap:
+            name: grafana-dashboard-orbitcp
