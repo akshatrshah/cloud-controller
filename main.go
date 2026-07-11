@@ -61,13 +61,19 @@ func main() {
 	}
 	raftNode.Run()
 
+	metrics := NewMetrics(raftNode, store)
+	raftNode.SetMetrics(metrics)
+
 	resourceManager := NewResourceManager(raftNode, store)
+	resourceManager.SetMetrics(metrics)
 	reconciler := NewReconciler(raftNode, store)
+	reconciler.SetMetrics(metrics)
 	go reconciler.Run()
 
 	mux := http.NewServeMux()
 	raftNode.transport.RegisterHandlers(mux)
 	RegisterAPIHandlers(mux, raftNode, store, resourceManager)
+	mux.HandleFunc("GET /metrics", metrics.ServeHTTP)
 
 	addr := ":" + port
 	log.Printf("[%s] listening on %s", nodeID, addr)

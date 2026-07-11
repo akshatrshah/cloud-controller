@@ -101,8 +101,16 @@ type Raft struct {
 	store     StateMachine
 	storage   Storage // nil = in-memory only
 	transport *Transport
+	metrics   *Metrics // nil = metrics disabled
 
 	applyCh chan struct{} // signals the apply loop that commitIndex advanced
+}
+
+// SetMetrics attaches a metrics recorder after construction. Safe to leave
+// unset entirely (all metric calls are nil-checked) -- metrics are an
+// observability add-on, never a correctness dependency.
+func (r *Raft) SetMetrics(m *Metrics) {
+	r.metrics = m
 }
 
 func NewRaft(id string, peers []string, store StateMachine, storage Storage) *Raft {
@@ -227,6 +235,10 @@ func (r *Raft) startElection() {
 	lastIdx, lastTerm := r.lastLogIndexTerm()
 	r.mu.Unlock()
 
+	if r.metrics != nil {
+		r.metrics.IncElectionsStarted()
+	}
+
 	log.Printf("[%s] term=%d starting election, need quorum=%d/%d", r.id, term, r.quorum(), len(r.peers)+1)
 
 	votes := 1 // vote for self
@@ -275,6 +287,9 @@ func (r *Raft) becomeLeader() {
 	r.state = Leader
 	r.leaderID = r.id
 	log.Printf("[%s] *** ELECTED LEADER *** term=%d votes>=quorum", r.id, r.currentTerm)
+	if r.metrics != nil {
+		r.metrics.IncElectionsWon()
+	}
 
 	lastIdx, _ := r.lastLogIndexTerm()
 	for _, p := range r.peers {
@@ -438,6 +453,9 @@ func (r *Raft) Propose(cmd Command) (int, error) {
 	if r.state != Leader {
 		leader := r.leaderID
 		r.mu.Unlock()
+		if r.metrics != nil {
+			r.metrics.IncProposalsFailed()
+		}
 		return 0, &NotLeaderError{LeaderID: leader}
 	}
 	entry := LogEntry{
@@ -466,12 +484,21 @@ func (r *Raft) Propose(cmd Command) (int, error) {
 		stillLeader := r.state == Leader
 		r.mu.Unlock()
 		if applied {
+			if r.metrics != nil {
+				r.metrics.IncProposalsSucceeded()
+			}
 			return idx, nil
 		}
 		if !stillLeader {
+			if r.metrics != nil {
+				r.metrics.IncProposalsFailed()
+			}
 			return 0, &NotLeaderError{LeaderID: ""}
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	if r.metrics != nil {
+		r.metrics.IncProposalsFailed()
 	}
 	return 0, &TimeoutError{}
 }

@@ -14,12 +14,18 @@ import (
 // quorum -- the control plane can never have two nodes disagreeing about
 // whether a VM is RUNNING or TERMINATED.
 type ResourceManager struct {
-	raft  *Raft
-	store *ResourceStore
+	raft    *Raft
+	store   *ResourceStore
+	metrics *Metrics // nil = metrics disabled
 }
 
 func NewResourceManager(r *Raft, s *ResourceStore) *ResourceManager {
 	return &ResourceManager{raft: r, store: s}
+}
+
+// SetMetrics attaches a metrics recorder after construction.
+func (rm *ResourceManager) SetMetrics(m *Metrics) {
+	rm.metrics = m
 }
 
 func newResourceID(kind string) string {
@@ -45,6 +51,9 @@ func (rm *ResourceManager) Create(kind, spec string) (Resource, error) {
 	})
 	if err != nil {
 		return Resource{}, err
+	}
+	if rm.metrics != nil {
+		rm.metrics.IncResourcesCreated()
 	}
 	r, _ := rm.store.Get(id)
 	return r, nil
@@ -92,12 +101,18 @@ const (
 )
 
 type Reconciler struct {
-	raft  *Raft
-	store *ResourceStore
+	raft    *Raft
+	store   *ResourceStore
+	metrics *Metrics // nil = metrics disabled
 }
 
 func NewReconciler(r *Raft, s *ResourceStore) *Reconciler {
 	return &Reconciler{raft: r, store: s}
+}
+
+// SetMetrics attaches a metrics recorder after construction.
+func (rc *Reconciler) SetMetrics(m *Metrics) {
+	rc.metrics = m
 }
 
 // Run should be started once in a goroutine. It's safe to run on every
@@ -131,6 +146,9 @@ func (rc *Reconciler) reconcileOnce() {
 	for _, r := range rc.store.ListByState(StateTerminating) {
 		if now-r.UpdatedAtUnix >= int64(simulatedTeardownTime.Seconds()) {
 			rc.propose(r.ID, StateTerminated, "reconciler: teardown complete")
+			if rc.metrics != nil {
+				rc.metrics.IncResourcesTerminated()
+			}
 		}
 	}
 }
