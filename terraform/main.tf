@@ -4,8 +4,6 @@ resource "kubernetes_namespace" "orbitcp" {
   }
 }
 
-# --- Postgres: durable persistence backing every control-plane node's WAL ---
-
 resource "kubernetes_secret" "postgres_credentials" {
   metadata {
     name      = "postgres-credentials"
@@ -102,8 +100,9 @@ resource "kubernetes_stateful_set" "postgres" {
   }
 }
 
-# --- Control plane: headless service for stable peer DNS (Raft) ---
-
+# Headless service: stable peer DNS, exposing BOTH the HTTP API port and
+# hashicorp/raft's own TCP consensus transport (a separate binary
+# protocol, derived as HTTP port + 10000).
 resource "kubernetes_service" "raft_headless" {
   metadata {
     name      = "raft-headless"
@@ -118,10 +117,13 @@ resource "kubernetes_service" "raft_headless" {
       port        = 8080
       target_port = 8080
     }
+    port {
+      name        = "raft-transport"
+      port        = 18080
+      target_port = 18080
+    }
   }
 }
-
-# --- Control plane: client-facing API service ---
 
 resource "kubernetes_service" "orbitcp" {
   metadata {
@@ -146,8 +148,6 @@ resource "kubernetes_pod_disruption_budget_v1" "orbitcp" {
     namespace = kubernetes_namespace.orbitcp.metadata[0].name
   }
   spec {
-    # quorum for N replicas is floor(N/2)+1; never let voluntary
-    # disruptions take the cluster below quorum + 1 spare node.
     min_available = var.replicas - 1
     selector {
       match_labels = { app = "orbitcp" }
@@ -157,8 +157,7 @@ resource "kubernetes_pod_disruption_budget_v1" "orbitcp" {
 
 locals {
   # Builds "raft-0.raft-headless:8080,raft-1.raft-headless:8080,..." for
-  # however many replicas are configured, so the CLUSTER env var always
-  # matches var.replicas without hand-editing a string.
+  # however many replicas are configured.
   cluster_addrs = join(",", [
     for i in range(var.replicas) : "raft-${i}.raft-headless:8080"
   ])
@@ -170,8 +169,8 @@ resource "kubernetes_stateful_set" "raft" {
     namespace = kubernetes_namespace.orbitcp.metadata[0].name
   }
   spec {
-    service_name = kubernetes_service.raft_headless.metadata[0].name
-    replicas     = var.replicas
+    service_name           = kubernetes_service.raft_headless.metadata[0].name
+    replicas                = var.replicas
     pod_management_policy = "Parallel"
     selector {
       match_labels = { app = "orbitcp" }
@@ -195,12 +194,16 @@ resource "kubernetes_stateful_set" "raft" {
           }
         }
         container {
-          name  = "orbitcp"
-          image = var.image
+          name               = "orbitcp"
+          image              = var.image
           image_pull_policy = "IfNotPresent"
           port {
             container_port = 8080
             name           = "http"
+          }
+          port {
+            container_port = 18080
+            name           = "raft-transport"
           }
           env {
             name = "NODE_ID"

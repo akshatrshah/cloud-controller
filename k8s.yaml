@@ -3,7 +3,6 @@ kind: Namespace
 metadata:
   name: orbitcp
 ---
-# --- Postgres: durable persistence backing every control-plane node's WAL ---
 apiVersion: v1
 kind: Service
 metadata:
@@ -78,11 +77,11 @@ spec:
         accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            # Small on purpose: this is metadata/state, not bulk data.
-            # Well within any free-tier default storage class quota.
             storage: 1Gi
 ---
-# --- Control plane: headless service for stable peer DNS (Raft) ---
+# Headless service: stable peer DNS. Exposes BOTH the HTTP API port and
+# hashicorp/raft's own TCP consensus transport (a separate binary
+# protocol, not HTTP -- it can't share port 8080).
 apiVersion: v1
 kind: Service
 metadata:
@@ -92,14 +91,25 @@ metadata:
     app: orbitcp
 spec:
   clusterIP: None
+  # REQUIRED for a StatefulSet's peer-discovery headless service: without
+  # this, Kubernetes only publishes a pod's DNS record once it's already
+  # Ready. But every raft node resolves its OWN hostname just to bind its
+  # transport listener -- which has to happen BEFORE it can ever pass its
+  # readiness check. Omitting this creates an actual deadlock (not ready
+  # -> no DNS record -> can't start listening -> never ready), which
+  # surfaced as a pod consistently failing to resolve its own name across
+  # dozens of restarts rather than a one-off timing fluke.
+  publishNotReadyAddresses: true
   selector:
     app: orbitcp
   ports:
     - name: http
       port: 8080
       targetPort: 8080
+    - name: raft-transport
+      port: 18080
+      targetPort: 18080
 ---
-# --- Control plane: client-facing API service ---
 apiVersion: v1
 kind: Service
 metadata:
@@ -122,8 +132,6 @@ metadata:
   name: orbitcp-pdb
   namespace: orbitcp
 spec:
-  # 5 replicas -> quorum is 3. Never let voluntary disruptions (node
-  # drains, rolling upgrades) take the cluster below quorum.
   minAvailable: 4
   selector:
     matchLabels:
@@ -152,8 +160,8 @@ spec:
             - weight: 100
               podAffinityTerm:
                 labelSelector:
-                  matchLabels:
-                    app: orbitcp
+                    matchLabels:
+                      app: orbitcp
                 topologyKey: kubernetes.io/hostname
       containers:
         - name: orbitcp
@@ -162,6 +170,8 @@ spec:
           ports:
             - containerPort: 8080
               name: http
+            - containerPort: 18080
+              name: raft-transport
           env:
             - name: NODE_ID
               valueFrom:
@@ -179,10 +189,6 @@ spec:
                   key: POSTGRES_PASSWORD
             - name: PG_DSN
               value: "postgres://orbitcp:$(POSTGRES_PASSWORD)@postgres:5432/orbitcp?sslmode=disable"
-          # Deliberately tiny footprint: 5 pods x these limits = 250m CPU /
-          # 160Mi memory total request, well inside any free-tier cluster
-          # (kind, a single e2-micro/t3.micro node, Oracle's Always-Free
-          # ARM VMs, etc) -- plus the single small Postgres instance above.
           resources:
             requests:
               cpu: 25m
