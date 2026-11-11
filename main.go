@@ -1,17 +1,12 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
-
-	"github.com/hashicorp/raft"
 )
 
 // Config is sourced entirely from environment variables so the same
@@ -20,15 +15,24 @@ import (
 // Downward API.
 //
 //	NODE_ID  - this node's identity, e.g. "raft-0" (Downward API: metadata.name)
-//	CLUSTER  - comma-separated addr:port list of ALL nodes' HTTP addresses,
-//	           e.g. "raft-0.raft-headless:8080,raft-1.raft-headless:8080,..."
-//	           (the actual Raft consensus TCP transport runs on HTTP-port+10000
-//	           on each node -- derived automatically, not separately configured)
+//	CLUSTER  - comma-separated addr:port list of ALL nodes, e.g.
+//	           "raft-0.raft-headless:8080,raft-1.raft-headless:8080,..."
 //	PORT     - HTTP port to listen on (default 8080)
-//	PG_DSN   - Postgres connection string for durable persistence. Optional:
-//	           if unset, runs in-memory only (fine for local dev/tests, NOT
-//	           crash-safe).
+//	PG_DSN   - Postgres connection string for durable persistence, e.g.
+//	           "postgres://user:pass@host:5432/orbitcp?sslmode=disable".
+//	           Optional: if unset, runs in-memory only (fine for local
+//	           dev/tests, NOT crash-safe -- see README).
+//
+// `orbitcp loadgen ...` runs the built-in load generator instead of a
+// node (see loadgen.go) -- shipping it in the same image means it can run
+// as a pod inside the cluster, avoiding the kubectl port-forward
+// bottleneck that caps client-side load tests from a laptop.
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "loadgen" {
+		runLoadgen(os.Args[2:])
+		return
+	}
+
 	nodeID := os.Getenv("NODE_ID")
 	if nodeID == "" {
 		h, _ := os.Hostname()
@@ -41,144 +45,70 @@ func main() {
 	}
 	allAddrs := strings.Split(clusterEnv, ",")
 
-	httpPortStr := os.Getenv("PORT")
-	if httpPortStr == "" {
-		httpPortStr = "8080"
-	}
-	httpPort, err := strconv.Atoi(httpPortStr)
-	if err != nil {
-		log.Fatalf("invalid PORT %q: %v", httpPortStr, err)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
 
-	selfHTTPAddr, peerHTTPAddrs := resolveSelf(nodeID, allAddrs)
-	selfRaftAddr := raftAddrFromHTTPAddr(selfHTTPAddr)
-	log.Printf("[%s] self=%s (raft transport on %s) peers=%v", nodeID, selfHTTPAddr, selfRaftAddr, peerHTTPAddrs)
+	selfAddr, peers := resolveSelf(nodeID, allAddrs)
+	log.Printf("[%s] self=%s peers=%v", nodeID, selfAddr, peers)
 
-	// --- Durable storage: Postgres if configured, in-memory otherwise ---
-	var logStore raft.LogStore
-	var stableStore raft.StableStore
-	persistent := false
+	var storage Storage
 	if dsn := os.Getenv("PG_DSN"); dsn != "" {
-		pgStore, err := NewPostgresStore(dsn, selfHTTPAddr)
+		pgStorage, err := NewPostgresStorage(dsn, selfAddr)
 		if err != nil {
 			log.Fatalf("[%s] failed to connect to Postgres persistence: %v", nodeID, err)
 		}
-		logStore = pgStore
-		stableStore = pgStore
-		persistent = true
+		storage = pgStorage
 		log.Printf("[%s] durable persistence ENABLED (Postgres)", nodeID)
 	} else {
-		mem := raft.NewInmemStore()
-		logStore = mem
-		stableStore = mem
 		log.Printf("[%s] WARNING: PG_DSN not set -- running IN-MEMORY ONLY, state will not survive a restart", nodeID)
 	}
 
-	// Snapshots: local disk, one directory per node (unique by port, so
-	// multiple nodes can run on one machine for local dev without
-	// colliding). Snapshots are NOT Postgres-backed in this project --
-	// only the log/term/vote are (see README's "Known limitations").
-	snapDir := filepath.Join(os.TempDir(), fmt.Sprintf("orbitcp-snapshots-%d", httpPort))
-	if err := os.MkdirAll(snapDir, 0o755); err != nil {
-		log.Fatalf("[%s] failed to create snapshot dir: %v", nodeID, err)
-	}
-	snapStore, err := raft.NewFileSnapshotStore(snapDir, 2, os.Stderr)
-	if err != nil {
-		log.Fatalf("[%s] failed to create snapshot store: %v", nodeID, err)
-	}
-
-	// --- Transport: raft's own TCP-based RPC, not our HTTP API ---
-	// A StatefulSet pod's own headless-service DNS record isn't guaranteed
-	// to be published by CoreDNS the instant the pod starts -- there's a
-	// small propagation delay after the pod gets its IP and the endpoint
-	// controller registers it. A one-shot lookup here can lose that race
-	// and crash-loop the pod indefinitely (log.Fatalf -> restart -> same
-	// race -> repeat). Retry with backoff instead of failing on the first
-	// miss. Found by watching a real StatefulSet rolling update actually
-	// hit this on a freshly-recreated pod, not by code review.
-	var raftBindAddr *net.TCPAddr
-	resolveDeadline := time.Now().Add(30 * time.Second)
-	for {
-		raftBindAddr, err = net.ResolveTCPAddr("tcp", selfRaftAddr)
-		if err == nil {
-			break
-		}
-		if time.Now().After(resolveDeadline) {
-			log.Fatalf("[%s] failed to resolve raft transport address %q after 30s: %v", nodeID, selfRaftAddr, err)
-		}
-		log.Printf("[%s] waiting for DNS to resolve %q (StatefulSet pod DNS can lag briefly on startup): %v", nodeID, selfRaftAddr, err)
-		time.Sleep(1 * time.Second)
-	}
-	transport, err := raft.NewTCPTransport(selfRaftAddr, raftBindAddr, 3, 10*time.Second, os.Stderr)
-	if err != nil {
-		log.Fatalf("[%s] failed to create raft transport: %v", nodeID, err)
-	}
-
 	store := NewResourceStore()
+	raftNode := NewRaft(selfAddr, peers, store, storage)
 
-	config := raft.DefaultConfig()
-	config.LocalID = raft.ServerID(selfHTTPAddr)
-	// Election timeout deliberately wide (default is ~1s) so it
-	// comfortably exceeds real pod-to-pod network latency inside
-	// Kubernetes and avoids split-vote storms during demos.
-	config.HeartbeatTimeout = 1500 * time.Millisecond
-	config.ElectionTimeout = 1500 * time.Millisecond
-
-	raftNode, err := raft.NewRaft(config, store, logStore, stableStore, snapStore, transport)
-	if err != nil {
-		log.Fatalf("[%s] failed to start raft: %v", nodeID, err)
+	restoreStart := time.Now()
+	if err := raftNode.RestoreFromStorage(); err != nil {
+		log.Fatalf("[%s] failed to restore from persisted storage: %v", nodeID, err)
 	}
-
-	// Bootstrap the cluster ONCE, from a fixed static configuration listing
-	// every known node. Only takes effect if this node has no existing
-	// state (fresh start); on a restart, hashicorp/raft loads its prior
-	// configuration from the log/stable store instead, so calling this
-	// again is intentionally a safe, ignorable no-op.
-	hasState, err := raft.HasExistingState(logStore, stableStore, snapStore)
-	if err != nil {
-		log.Fatalf("[%s] failed to check existing state: %v", nodeID, err)
-	}
-	if !hasState {
-		servers := []raft.Server{{
-			Suffrage: raft.Voter,
-			ID:       raft.ServerID(selfHTTPAddr),
-			Address:  raft.ServerAddress(selfRaftAddr),
-		}}
-		for _, p := range peerHTTPAddrs {
-			servers = append(servers, raft.Server{
-				Suffrage: raft.Voter,
-				ID:       raft.ServerID(p),
-				Address:  raft.ServerAddress(raftAddrFromHTTPAddr(p)),
-			})
-		}
-		bootErr := raftNode.BootstrapCluster(raft.Configuration{Servers: servers}).Error()
-		if bootErr != nil {
-			log.Printf("[%s] bootstrap: %v (safe to ignore if cluster was already bootstrapped by a peer)", nodeID, bootErr)
-		} else {
-			log.Printf("[%s] bootstrap succeeded (%d servers)", nodeID, len(servers))
-		}
+	if storage != nil {
+		st := raftNode.GetStatus()
+		log.Printf("[%s] restored from Postgres in %dms: term=%d log_entries=%d commit_index=%d resources=%d",
+			nodeID, time.Since(restoreStart).Milliseconds(), st.Term, st.LogLength-1, st.CommitIndex, len(store.List()))
 	}
 
 	metrics := NewMetrics(raftNode, store)
+	raftNode.SetMetrics(metrics)
+
 	resourceManager := NewResourceManager(raftNode, store)
 	resourceManager.SetMetrics(metrics)
 	reconciler := NewReconciler(raftNode, store)
 	reconciler.SetMetrics(metrics)
-	go reconciler.Run()
 
 	mux := http.NewServeMux()
-	RegisterAPIHandlers(mux, raftNode, selfHTTPAddr, persistent, store, resourceManager)
+	raftNode.transport.RegisterHandlers(mux)
+	RegisterAPIHandlers(mux, raftNode, store, resourceManager)
 	mux.HandleFunc("GET /metrics", metrics.ServeHTTP)
 
-	addr := ":" + httpPortStr
+	// Bind the listener BEFORE starting the election timer. Otherwise a
+	// restarted node can time out and start a disruptive election while
+	// the leader's heartbeats are still bouncing off a closed port.
+	addr := ":" + port
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("[%s] failed to listen on %s: %v", nodeID, addr, err)
+	}
+	raftNode.Run()
+	go reconciler.Run()
+
 	log.Printf("[%s] listening on %s", nodeID, addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.Serve(ln, mux))
 }
 
-// resolveSelf finds this node's own HTTP address within the full cluster
-// list (matched by NODE_ID prefix, e.g. "raft-0" matches
-// "raft-0.raft-headless:8080") and returns it along with every OTHER
-// node's HTTP address (the peers).
+// resolveSelf finds this node's own address within the full cluster list
+// (matched by NODE_ID prefix, e.g. "raft-0" matches "raft-0.raft-headless:8080")
+// and returns it along with the list of every OTHER node (the peers).
 func resolveSelf(nodeID string, allAddrs []string) (string, []string) {
 	var self string
 	var peers []string
@@ -191,6 +121,8 @@ func resolveSelf(nodeID string, allAddrs []string) (string, []string) {
 		if i := strings.LastIndex(a, ":"); i != -1 {
 			host = a[:i]
 		}
+		// Matches either a bare pod name ("raft-0" == "raft-0") or a full
+		// k8s DNS name ("raft-0" is a prefix of "raft-0.raft-headless...").
 		if host == nodeID || strings.HasPrefix(host, nodeID+".") || a == nodeID {
 			self = a
 		} else {
@@ -198,52 +130,9 @@ func resolveSelf(nodeID string, allAddrs []string) (string, []string) {
 		}
 	}
 	if self == "" {
+		// Fallback: NODE_ID didn't match anything in CLUSTER (e.g. local
+		// dev run) -- treat NODE_ID itself as the self address.
 		self = nodeID
 	}
 	return self, peers
-}
-
-// raftAddrFromHTTPAddr derives the Raft consensus transport's TCP address
-// from a node's HTTP address by adding 10000 to the port -- e.g.
-// "raft-0.raft-headless:8080" -> "raft-0.raft-headless:18080". Keeps the
-// externally-configured CLUSTER env var in familiar HTTP-address form
-// while giving hashicorp/raft's TCP transport its own separate port (it
-// speaks a binary protocol, not HTTP, so it can't share port 8080).
-//
-// The offset is deliberately large (10000, not +1): local multi-node
-// testing uses sequential HTTP ports on localhost (9701, 9702, 9703...),
-// and a +1 offset means node 9701's raft port (9702) collides directly
-// with node 9702's own HTTP port -- a real bug hit while testing this
-// locally, not a hypothetical.
-func raftAddrFromHTTPAddr(httpAddr string) string {
-	i := strings.LastIndex(httpAddr, ":")
-	if i == -1 {
-		return httpAddr
-	}
-	host := httpAddr[:i]
-	port, err := strconv.Atoi(httpAddr[i+1:])
-	if err != nil {
-		return httpAddr
-	}
-	return fmt.Sprintf("%s:%d", host, port+10000)
-}
-
-// httpAddrFromRaftAddr is the inverse of raftAddrFromHTTPAddr. raft.Raft's
-// own Leader() method returns the leader's TRANSPORT address (since that's
-// what the library itself uses internally) -- but an HTTP client following
-// a leader_id from a 421 response needs the HTTP address, not the binary
-// Raft protocol port. Without this conversion, clients would be pointed at
-// the wrong port entirely. Found by actually curling the leader_id from a
-// live cluster and getting a connection reset, not by code review.
-func httpAddrFromRaftAddr(raftAddr string) string {
-	i := strings.LastIndex(raftAddr, ":")
-	if i == -1 {
-		return raftAddr
-	}
-	host := raftAddr[:i]
-	port, err := strconv.Atoi(raftAddr[i+1:])
-	if err != nil || port < 10000 {
-		return raftAddr
-	}
-	return fmt.Sprintf("%s:%d", host, port-10000)
 }

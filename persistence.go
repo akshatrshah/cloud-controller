@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	_ "github.com/lib/pq"
+	"time"
+
+	"github.com/lib/pq"
 )
 
 // PostgresStorage persists exactly what the Raft paper requires to survive
@@ -31,6 +33,12 @@ func NewPostgresStorage(dsn, nodeID string) (*PostgresStorage, error) {
 	if err != nil {
 		return nil, fmt.Errorf("opening postgres connection: %w", err)
 	}
+	// Raft writes are serialized per node (they happen under the Raft
+	// mutex), so a handful of connections is plenty. Capping the pool
+	// keeps 5 nodes well under Postgres's default max_connections=100.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(8)
+	db.SetConnMaxIdleTime(5 * time.Minute)
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("pinging postgres: %w", err)
 	}
@@ -101,37 +109,34 @@ func (ps *PostgresStorage) LoadMeta() (term int, votedFor string, commitIndex in
 	return term, votedFor, commitIndex, true, nil
 }
 
+// AppendLog writes a batch of entries with ONE multi-row INSERT (one
+// network round trip, one fsync on commit) instead of one statement per
+// entry. With group commit on the leader and batched AppendEntries on
+// followers, a single call commonly carries dozens to hundreds of entries.
 func (ps *PostgresStorage) AppendLog(entries []LogEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	tx, err := ps.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`
-		INSERT INTO raft_log (node_id, log_index, term, command_json)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (node_id, log_index) DO UPDATE
-		SET term = EXCLUDED.term, command_json = EXCLUDED.command_json
-	`)
-	if err != nil {
-		return err
-	}
-	defer stmt.Close()
-
-	for _, e := range entries {
+	indexes := make([]int64, len(entries))
+	terms := make([]int64, len(entries))
+	cmds := make([]string, len(entries))
+	for i, e := range entries {
 		cmdJSON, err := json.Marshal(e.Command)
 		if err != nil {
 			return err
 		}
-		if _, err := stmt.Exec(ps.nodeID, e.Index, e.Term, string(cmdJSON)); err != nil {
-			return err
-		}
+		indexes[i] = int64(e.Index)
+		terms[i] = int64(e.Term)
+		cmds[i] = string(cmdJSON)
 	}
-	return tx.Commit()
+	_, err := ps.db.Exec(`
+		INSERT INTO raft_log (node_id, log_index, term, command_json)
+		SELECT $1, idx, term, cmd
+		FROM unnest($2::int[], $3::int[], $4::text[]) AS t(idx, term, cmd)
+		ON CONFLICT (node_id, log_index) DO UPDATE
+		SET term = EXCLUDED.term, command_json = EXCLUDED.command_json
+	`, ps.nodeID, pq.Array(indexes), pq.Array(terms), pq.Array(cmds))
+	return err
 }
 
 func (ps *PostgresStorage) TruncateLogFrom(index int) error {

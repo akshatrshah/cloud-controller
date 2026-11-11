@@ -23,6 +23,9 @@ FAIL=0
 PG_DSN="${TEST_PG_DSN:-postgres://postgres:postgres@127.0.0.1:5432/orbitcp?sslmode=disable}"
 
 pass() { PASS=$((PASS+1)); echo "  PASS: $1"; }
+# Millisecond wall clock that works on both macOS and Linux (BSD `date`
+# has no %N, so `date +%s%N` silently produces garbage on a Mac).
+now_ms() { perl -MTime::HiRes=time -e 'printf("%d\n", time()*1000)'; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
 # setsid (util-linux) isn't available on macOS by default. We only need
@@ -127,27 +130,30 @@ else
   fail "resource state only replicated to $REPLICATED/5 nodes"
 fi
 
-echo "==> Test: create on a FOLLOWER is rejected with 421 + leader hint"
+echo "==> Test: create on a FOLLOWER is forwarded to the leader and commits"
 FOLLOWER_PORT=""
 for p in "${PORTS[@]}"; do [[ "$p" != "$LEADER_PORT" ]] && { FOLLOWER_PORT="$p"; break; }; done
 HTTP_CODE=$(curl -s -o /tmp/follower_resp.json -w '%{http_code}' \
   -X POST "http://127.0.0.1:${FOLLOWER_PORT}/resources" -d '{"kind":"compute","spec":"{}"}')
-if [[ "$HTTP_CODE" == "421" ]] && grep -q "leader_id" /tmp/follower_resp.json; then
-  pass "follower correctly rejects writes with 421 + leader_id"
+FWD_ID=$(grep -o '"id":"[^"]*"' /tmp/follower_resp.json | head -1 | cut -d'"' -f4)
+LEADER_HAS=$(curl -s --max-time 1 "http://127.0.0.1:${LEADER_PORT}/resources/${FWD_ID}" | grep -c '"id"' || true)
+if [[ "$HTTP_CODE" == "200" ]] && [[ -n "$FWD_ID" ]] && [[ "$LEADER_HAS" -ge 1 ]]; then
+  pass "follower forwarded the write to the leader; committed as $FWD_ID"
 else
-  fail "follower did not reject write as expected (got HTTP $HTTP_CODE)"
+  fail "follower write was not forwarded/committed (HTTP $HTTP_CODE: $(cat /tmp/follower_resp.json))"
 fi
 
 echo "==> Test: invalid state transition is rejected deterministically"
 INVALID=$(curl -s -X POST "http://127.0.0.1:${LEADER_PORT}/resources" -d '{"kind":"network","spec":"{}"}')
 INVALID_ID=$(echo "$INVALID" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 TERM_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${LEADER_PORT}/resources/${INVALID_ID}/terminate")
-# PENDING -> TERMINATING is actually valid in this state machine's design
-# (you can cancel a not-yet-provisioned resource), so this should succeed;
-# terminating it AGAIN while already TERMINATING should be rejected.
-TERM_CODE2=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:${LEADER_PORT}/resources/${INVALID_ID}/terminate")
-if [[ "$TERM_CODE" == "200" ]] && [[ "$TERM_CODE2" == "400" ]]; then
-  pass "state machine allows cancel-while-pending but rejects double-terminate"
+# PENDING -> TERMINATING is valid in this state machine's design (you can
+# cancel a not-yet-provisioned resource). Terminating it AGAIN while it is
+# already TERMINATING is an idempotent no-op that returns 200, so a client
+# retrying across a leader failover can't get a spurious error.
+TERM_CODE2=$(curl -s -o /tmp/term2.json -w '%{http_code}' -X POST "http://127.0.0.1:${LEADER_PORT}/resources/${INVALID_ID}/terminate")
+if [[ "$TERM_CODE" == "200" ]] && [[ "$TERM_CODE2" == "200" ]] && grep -q '"state":"TERMINATING"' /tmp/term2.json; then
+  pass "state machine allows cancel-while-pending; repeated terminate is idempotent"
 else
   fail "unexpected transition behavior: first=$TERM_CODE second=$TERM_CODE2"
 fi
@@ -155,22 +161,27 @@ fi
 echo "==> CHAOS TEST 1: kill the leader mid-flight, verify automatic failover"
 LEADER_PID=""
 for i in "${!PORTS[@]}"; do [[ "${PORTS[$i]}" == "$LEADER_PORT" ]] && LEADER_PID="${PIDS[$i]}"; done
+KILL_MS=$(now_ms)
 kill -9 "$LEADER_PID"
 echo "    killed leader on port ${LEADER_PORT} (pid ${LEADER_PID})"
 
 NEW_LEADER_PORT=""
-for i in $(seq 1 20); do
+while (( $(now_ms) - KILL_MS < 5000 )); do
   for p in "${PORTS[@]}"; do
     [[ "$p" == "$LEADER_PORT" ]] && continue
-    STATE=$(curl -s --max-time 1 "http://127.0.0.1:${p}/status" 2>/dev/null | grep -o '"state":"[A-Z]*"' | cut -d'"' -f4)
+    STATE=$(curl -s --max-time 0.2 "http://127.0.0.1:${p}/status" 2>/dev/null | grep -o '"state":"[A-Z]*"' | cut -d'"' -f4)
     if [[ "$STATE" == "LEADER" ]]; then NEW_LEADER_PORT="$p"; break 2; fi
   done
-  sleep 0.5
+  sleep 0.02
 done
-if [[ -n "$NEW_LEADER_PORT" ]]; then
-  pass "new leader (port $NEW_LEADER_PORT) elected within 10s of leader failure"
+FAILOVER_MS=$(( $(now_ms) - KILL_MS ))
+SELF_REPORTED_MS=$(curl -s --max-time 1 "http://127.0.0.1:${NEW_LEADER_PORT}/status" 2>/dev/null | grep -o '"last_failover_ms":[0-9]*' | cut -d: -f2)
+if [[ -n "$NEW_LEADER_PORT" ]] && (( FAILOVER_MS < 1000 )); then
+  pass "new leader (port $NEW_LEADER_PORT) elected ${FAILOVER_MS}ms after kill -9 (leader-reported gap ${SELF_REPORTED_MS}ms), under 1s"
+elif [[ -n "$NEW_LEADER_PORT" ]]; then
+  fail "new leader elected but took ${FAILOVER_MS}ms (want < 1000ms)"
 else
-  fail "no new leader elected after killing the old one"
+  fail "no new leader elected within 5s of killing the old one"
 fi
 
 echo "==> Test: previously-committed resource survived the leader crash (zero data loss)"
@@ -194,6 +205,7 @@ done
 kill -9 "$FOLLOWER2_PID"
 echo "    killed follower on port ${FOLLOWER2_PORT} (pid ${FOLLOWER2_PID}) -- all its in-memory state is gone"
 
+RESTART_MS=$(now_ms)
 NODE_ID="127.0.0.1:${FOLLOWER2_PORT}" PORT="$FOLLOWER2_PORT" CLUSTER="$CLUSTER" PG_DSN="$PG_DSN" \
   run_bg "$BIN" > "/tmp/orbitcp-itest-${FOLLOWER2_PORT}-restart.log" 2>&1 < /dev/null
 RESTARTED_PID=$!
@@ -206,13 +218,16 @@ PIDS+=("$RESTARTED_PID")
 # checking before the restarted process has even finished Go runtime
 # startup. Poll briefly instead of a single fixed-delay check.
 RECOVERED_STATE=""
-for i in $(seq 1 20); do
-  RECOVERED_STATE=$(curl -s --max-time 1 "http://127.0.0.1:${FOLLOWER2_PORT}/resources/${RES_ID}" 2>/dev/null | grep -o '"state":"[A-Z]*"' | cut -d'"' -f4)
+while (( $(now_ms) - RESTART_MS < 5000 )); do
+  RECOVERED_STATE=$(curl -s --max-time 0.2 "http://127.0.0.1:${FOLLOWER2_PORT}/resources/${RES_ID}" 2>/dev/null | grep -o '"state":"[A-Z]*"' | cut -d'"' -f4)
   [[ "$RECOVERED_STATE" == "RUNNING" ]] && break
-  sleep 0.1
+  sleep 0.01
 done
-if [[ "$RECOVERED_STATE" == "RUNNING" ]]; then
-  pass "restarted node recovered committed resource state (RUNNING) from Postgres almost instantly"
+RECOVERY_MS=$(( $(now_ms) - RESTART_MS ))
+if [[ "$RECOVERED_STATE" == "RUNNING" ]] && (( RECOVERY_MS < 1000 )); then
+  pass "restarted node serving its committed state (RUNNING) from Postgres ${RECOVERY_MS}ms after process start, under 1s ($(grep -o 'restored from Postgres in [0-9]*ms' "/tmp/orbitcp-itest-${FOLLOWER2_PORT}-restart.log"))"
+elif [[ "$RECOVERED_STATE" == "RUNNING" ]]; then
+  fail "restarted node recovered, but took ${RECOVERY_MS}ms (want < 1000ms)"
 else
   fail "restarted node did NOT recover state promptly (got '$RECOVERED_STATE') -- persistence may not be working"
 fi

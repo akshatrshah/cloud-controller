@@ -71,6 +71,7 @@ func (m *Metrics) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	writeGauge(&b, "orbitcp_raft_log_length", "Total number of entries in this node's replicated log", float64(status.LogLength))
 	writeGauge(&b, "orbitcp_raft_quorum_size", "Number of nodes required for a majority in this cluster", float64(status.Quorum))
 	writeGauge(&b, "orbitcp_raft_peer_count", "Number of other nodes in the cluster", float64(status.Peers))
+	writeGauge(&b, "orbitcp_raft_last_failover_ms", "On a node that took over from a failed leader: ms between its last contact with the old leader and becoming leader (0 = never)", float64(status.LastFailoverMs))
 
 	writeCounter(&b, "orbitcp_elections_started_total", "Total elections this node has started as a candidate", float64(atomic.LoadInt64(&m.electionsStarted)))
 	writeCounter(&b, "orbitcp_elections_won_total", "Total elections this node has won and become leader", float64(atomic.LoadInt64(&m.electionsWon)))

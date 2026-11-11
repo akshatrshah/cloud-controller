@@ -58,13 +58,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/postgresql/data
+          # Every committed write is an INSERT on each of the 5 nodes'
+          # logs, so Postgres needs real CPU under 500 concurrent clients.
           resources:
             requests:
-              cpu: 50m
-              memory: 64Mi
+              cpu: 250m
+              memory: 128Mi
             limits:
-              cpu: 200m
-              memory: 256Mi
+              cpu: "2"
+              memory: 512Mi
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "orbitcp"]
@@ -79,9 +81,9 @@ spec:
           requests:
             storage: 1Gi
 ---
-# Headless service: stable peer DNS. Exposes BOTH the HTTP API port and
-# hashicorp/raft's own TCP consensus transport (a separate binary
-# protocol, not HTTP -- it can't share port 8080).
+# Headless service: stable per-pod DNS names (raft-0.raft-headless, ...)
+# that peers use to reach each other. Raft RPCs and the client API share
+# port 8080 (Raft is plain HTTP+JSON, see transport.go).
 apiVersion: v1
 kind: Service
 metadata:
@@ -91,14 +93,11 @@ metadata:
     app: orbitcp
 spec:
   clusterIP: None
-  # REQUIRED for a StatefulSet's peer-discovery headless service: without
-  # this, Kubernetes only publishes a pod's DNS record once it's already
-  # Ready. But every raft node resolves its OWN hostname just to bind its
-  # transport listener -- which has to happen BEFORE it can ever pass its
-  # readiness check. Omitting this creates an actual deadlock (not ready
-  # -> no DNS record -> can't start listening -> never ready), which
-  # surfaced as a pod consistently failing to resolve its own name across
-  # dozens of restarts rather than a one-off timing fluke.
+  # Publish each pod's DNS record as soon as it has an IP, not only once
+  # it passes readiness. A restarted node must hear the leader's
+  # heartbeats within one election timeout (300-600ms); waiting for a
+  # readiness probe first would make it time out and start a needless
+  # pre-vote round instead of rejoining quietly.
   publishNotReadyAddresses: true
   selector:
     app: orbitcp
@@ -106,9 +105,6 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
-    - name: raft-transport
-      port: 18080
-      targetPort: 18080
 ---
 apiVersion: v1
 kind: Service
@@ -170,8 +166,6 @@ spec:
           ports:
             - containerPort: 8080
               name: http
-            - containerPort: 18080
-              name: raft-transport
           env:
             - name: NODE_ID
               valueFrom:
@@ -189,19 +183,23 @@ spec:
                   key: POSTGRES_PASSWORD
             - name: PG_DSN
               value: "postgres://orbitcp:$(POSTGRES_PASSWORD)@postgres:5432/orbitcp?sslmode=disable"
+          # A low CPU limit makes the kernel throttle the pod in 100ms
+          # windows. A throttled leader can't send its 75ms heartbeats,
+          # followers time out, and you get elections with no real
+          # failure. The limit has to leave headroom for load spikes.
           resources:
             requests:
-              cpu: 25m
-              memory: 24Mi
-            limits:
               cpu: 100m
               memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
           readinessProbe:
             httpGet:
               path: /healthz
               port: 8080
-            initialDelaySeconds: 2
-            periodSeconds: 5
+            initialDelaySeconds: 1
+            periodSeconds: 2
           livenessProbe:
             httpGet:
               path: /healthz

@@ -73,8 +73,9 @@ resource "kubernetes_stateful_set" "postgres" {
             mount_path = "/var/lib/postgresql/data"
           }
           resources {
-            requests = { cpu = "50m", memory = "64Mi" }
-            limits   = { cpu = "200m", memory = "256Mi" }
+            # Every committed write is an INSERT on each node's log.
+            requests = { cpu = "250m", memory = "128Mi" }
+            limits   = { cpu = "2", memory = "512Mi" }
           }
           readiness_probe {
             exec {
@@ -100,9 +101,9 @@ resource "kubernetes_stateful_set" "postgres" {
   }
 }
 
-# Headless service: stable peer DNS, exposing BOTH the HTTP API port and
-# hashicorp/raft's own TCP consensus transport (a separate binary
-# protocol, derived as HTTP port + 10000).
+# Headless service: stable per-pod DNS names (raft-0.raft-headless, ...)
+# that peers use to reach each other. Raft RPCs and the client API share
+# port 8080 (Raft is plain HTTP+JSON, see transport.go).
 resource "kubernetes_service" "raft_headless" {
   metadata {
     name      = "raft-headless"
@@ -112,15 +113,14 @@ resource "kubernetes_service" "raft_headless" {
   spec {
     cluster_ip = "None"
     selector   = { app = "orbitcp" }
+    # Publish each pod's DNS record as soon as it has an IP, not only once
+    # it passes readiness, so a restarted node hears the leader's
+    # heartbeats within one election timeout and rejoins quietly.
+    publish_not_ready_addresses = true
     port {
       name        = "http"
       port        = 8080
       target_port = 8080
-    }
-    port {
-      name        = "raft-transport"
-      port        = 18080
-      target_port = 18080
     }
   }
 }
@@ -201,10 +201,6 @@ resource "kubernetes_stateful_set" "raft" {
             container_port = 8080
             name           = "http"
           }
-          port {
-            container_port = 18080
-            name           = "raft-transport"
-          }
           env {
             name = "NODE_ID"
             value_from {
@@ -235,16 +231,18 @@ resource "kubernetes_stateful_set" "raft" {
             value = "postgres://orbitcp:$(POSTGRES_PASSWORD)@postgres:5432/orbitcp?sslmode=disable"
           }
           resources {
-            requests = { cpu = "25m", memory = "24Mi" }
-            limits   = { cpu = "100m", memory = "64Mi" }
+            # Low CPU limits throttle the pod and delay 75ms heartbeats,
+            # which causes elections with no real failure.
+            requests = { cpu = "100m", memory = "64Mi" }
+            limits   = { cpu = "1", memory = "512Mi" }
           }
           readiness_probe {
             http_get {
               path = "/healthz"
               port = 8080
             }
-            initial_delay_seconds = 2
-            period_seconds         = 5
+            initial_delay_seconds = 1
+            period_seconds         = 2
           }
           liveness_probe {
             http_get {
