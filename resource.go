@@ -28,6 +28,9 @@ func (rm *ResourceManager) SetMetrics(m *Metrics) {
 	rm.metrics = m
 }
 
+// ErrInvalidKind is returned for a kind other than compute/network/storage.
+var ErrInvalidKind = fmt.Errorf("kind must be one of: compute, network, storage")
+
 func newResourceID(kind string) string {
 	b := make([]byte, 4)
 	rand.Read(b)
@@ -38,10 +41,18 @@ func newResourceID(kind string) string {
 // loop (see below) will pick it up and drive it forward automatically --
 // callers don't manually walk the state machine.
 func (rm *ResourceManager) Create(kind, spec string) (Resource, error) {
+	return rm.CreateWithID(newResourceID(kind), kind, spec)
+}
+
+// CreateWithID is Create with a caller-chosen ID. The API layer picks the
+// ID once, at the node that first received the request, and reuses it on
+// every retry or forward. CREATE_RESOURCE is idempotent per ID in the
+// state machine, so retrying across a leader failover can never produce
+// two resources for one client request.
+func (rm *ResourceManager) CreateWithID(id, kind, spec string) (Resource, error) {
 	if kind != "compute" && kind != "network" && kind != "storage" {
-		return Resource{}, fmt.Errorf("kind must be one of: compute, network, storage")
+		return Resource{}, ErrInvalidKind
 	}
-	id := newResourceID(kind)
 	_, err := rm.raft.Propose(Command{
 		Op:            "CREATE_RESOURCE",
 		ResourceID:    id,
@@ -65,6 +76,9 @@ func (rm *ResourceManager) Terminate(id string) (Resource, error) {
 	current, ok := rm.store.Get(id)
 	if !ok {
 		return Resource{}, fmt.Errorf("resource %q not found", id)
+	}
+	if current.State == StateTerminating {
+		return current, nil // already requested (e.g. a retried request): idempotent success
 	}
 	if !isValidTransition(current.State, StateTerminating) {
 		return Resource{}, fmt.Errorf("cannot terminate resource in state %s", current.State)
