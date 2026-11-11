@@ -29,13 +29,31 @@ func (s State) String() string {
 	}
 }
 
+// Timing. Failover time is bounded by roughly electionTimeoutMax plus one
+// pre-vote and one vote round trip (a few ms inside a cluster), so these
+// values target < 1s leader failover.
+//
+// The usual Raft rule is broadcastTime << electionTimeout << MTBF. Pod-to-pod
+// RTT inside Kubernetes is ~1ms, so a 300-600ms window is still ~300x the
+// network delay. heartbeatInterval is kept at 1/4 of the minimum timeout, so
+// a follower would have to miss 4 heartbeats in a row before it suspects the
+// leader. The randomized spread (300ms wide) is what prevents split votes.
+const (
+	electionTimeoutMin = 300 * time.Millisecond
+	electionTimeoutMax = 600 * time.Millisecond
+	heartbeatInterval  = 75 * time.Millisecond
+	electionTick       = 10 * time.Millisecond
+	maxEntriesPerRPC   = 512 // caps AppendEntries size so a far-behind follower catches up in chunks instead of one giant request that times out
+	proposeTimeout     = 3 * time.Second
+)
+
 // Command is a single state-machine mutation applied once a log entry
 // commits. It represents an IaaS control-plane operation: creating a
 // compute/network/storage resource, or transitioning it through its
 // lifecycle (PENDING -> PROVISIONING -> RUNNING -> TERMINATING ->
 // TERMINATED, with FAILED reachable from any non-terminal state).
 type Command struct {
-	Op            string `json:"op"` // "CREATE_RESOURCE" or "TRANSITION_STATE"
+	Op            string `json:"op"` // "CREATE_RESOURCE", "TRANSITION_STATE", or "NOOP" (appended by each new leader)
 	ResourceID    string `json:"resource_id"`
 	Kind          string `json:"kind,omitempty"`   // "compute" | "network" | "storage" (CREATE only)
 	Spec          string `json:"spec,omitempty"`   // free-form JSON spec, e.g. {"cpu":4,"memory_gb":16} (CREATE only)
@@ -72,9 +90,10 @@ type Storage interface {
 }
 
 // Raft implements a simplified but functionally faithful subset of the
-// Raft consensus algorithm: randomized-timeout leader election and
-// majority-quorum log replication. See: Ongaro & Ousterhout, "In Search
-// of an Understandable Consensus Algorithm" (2014).
+// Raft consensus algorithm: randomized-timeout leader election (with the
+// pre-vote extension) and majority-quorum log replication. See: Ongaro &
+// Ousterhout, "In Search of an Understandable Consensus Algorithm" (2014),
+// and Ongaro's thesis section 9.6 for pre-vote.
 type Raft struct {
 	mu sync.Mutex
 
@@ -91,19 +110,27 @@ type Raft struct {
 	state             State
 	commitIndex       int
 	lastApplied       int
-	lastHeartbeatSeen time.Time
+	lastHeartbeatSeen time.Time // resets the election timer (heartbeats, granted votes, own elections)
+	lastLeaderContact time.Time // last valid AppendEntries from a leader; drives pre-vote rejection and the failover metric
 	leaderID          string
+	persistedIndex    int // highest log index durably written to Storage on THIS node
+	persistedCommit   int // commit index last written to Storage
 
 	// Volatile state on leaders (reinitialized after election)
 	nextIndex  map[string]int
 	matchIndex map[string]int
+	replicateC map[string]chan struct{} // per-peer "send now" triggers for the current term
+	lastAck    map[string]time.Time     // last successful AppendEntries reply per peer (check-quorum)
+
+	lastFailover time.Duration // gap between losing the previous leader and this node taking over (0 = never measured)
 
 	store     StateMachine
 	storage   Storage // nil = in-memory only
 	transport *Transport
 	metrics   *Metrics // nil = metrics disabled
 
-	applyCh chan struct{} // signals the apply loop that commitIndex advanced
+	applyCh   chan struct{} // signals the apply loop that commitIndex advanced
+	appliedCh chan struct{} // closed (and replaced) whenever entries are applied or leadership changes; wakes Propose waiters
 }
 
 // SetMetrics attaches a metrics recorder after construction. Safe to leave
@@ -125,7 +152,10 @@ func NewRaft(id string, peers []string, store StateMachine, storage Storage) *Ra
 		storage:           storage,
 		nextIndex:         make(map[string]int),
 		matchIndex:        make(map[string]int),
-		applyCh:           make(chan struct{}, 64),
+		replicateC:        make(map[string]chan struct{}),
+		lastAck:           make(map[string]time.Time),
+		applyCh:           make(chan struct{}, 1),
+		appliedCh:         make(chan struct{}),
 	}
 	r.transport = NewTransport(r)
 	return r
@@ -161,8 +191,10 @@ func (r *Raft) RestoreFromStorage() error {
 	if len(log) > 0 {
 		r.log = log
 	}
+	r.persistedIndex = len(r.log) - 1
 	if commitIndex > 0 && commitIndex < len(r.log) {
 		r.commitIndex = commitIndex
+		r.persistedCommit = commitIndex
 		for r.lastApplied < r.commitIndex {
 			r.lastApplied++
 			r.store.Apply(r.log[r.lastApplied].Command)
@@ -171,13 +203,18 @@ func (r *Raft) RestoreFromStorage() error {
 	return nil
 }
 
+// persistMetaLocked synchronously writes term/vote (and the current commit
+// index). Raft requires term and vote to be durable before the node acts
+// on them, so this is called with r.mu held on every term/vote change.
 func (r *Raft) persistMetaLocked() {
 	if r.storage == nil {
 		return
 	}
-	if err := r.storage.SaveMeta(r.currentTerm, r.votedFor, r.commitIndex); err != nil {
+	if err := r.storage.SaveMeta(r.currentTerm, r.votedFor, r.lastApplied); err != nil {
 		log.Printf("[%s] WARNING: failed to persist raft metadata: %v", r.id, err)
+		return
 	}
+	r.persistedCommit = r.lastApplied
 }
 
 // quorum returns the number of votes/acks needed for a majority of the
@@ -191,41 +228,103 @@ func (r *Raft) lastLogIndexTerm() (int, int) {
 	return last.Index, last.Term
 }
 
+// notifyLocked wakes every goroutine blocked in Propose so it can recheck
+// whether its entry was applied (or leadership was lost). r.mu must be held.
+func (r *Raft) notifyLocked() {
+	close(r.appliedCh)
+	r.appliedCh = make(chan struct{})
+}
+
+func kick(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default: // a wakeup is already pending; it will pick up this work too
+	}
+}
+
 // Run starts the election timer and the background apply loop. Call once,
-// in a goroutine, after construction (and after RestoreFromStorage).
+// after RestoreFromStorage and after the HTTP listener is bound.
 func (r *Raft) Run() {
+	r.mu.Lock()
+	// Restoring a long log from Postgres can take longer than an election
+	// timeout. Start the clock now, not at construction, so a restarted
+	// node gives the current leader a full timeout to reach it first.
+	r.lastHeartbeatSeen = time.Now()
+	r.mu.Unlock()
 	go r.applyLoop()
 	go r.electionTimerLoop()
 }
 
 func randomElectionTimeout() time.Duration {
-	// Deliberately wide (1.5s-3s) so it comfortably exceeds typical
-	// pod-to-pod network latency inside a k8s cluster and avoids
-	// split-vote storms during CI/kind demos.
-	return time.Duration(1500+rand.Intn(1500)) * time.Millisecond
+	spread := int64(electionTimeoutMax - electionTimeoutMin)
+	return electionTimeoutMin + time.Duration(rand.Int63n(spread))
 }
 
+// electionTimerLoop draws ONE random timeout per waiting period and checks
+// it every electionTick. (Re-drawing on every tick would bias the effective
+// timeout toward the minimum and defeat the randomization.)
 func (r *Raft) electionTimerLoop() {
+	timeout := randomElectionTimeout()
 	for {
-		timeout := randomElectionTimeout()
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(electionTick)
 
 		r.mu.Lock()
 		elapsed := time.Since(r.lastHeartbeatSeen)
 		state := r.state
+		if state == Leader {
+			r.checkQuorumLocked()
+		}
 		r.mu.Unlock()
 
-		if state != Leader && elapsed >= timeout {
-			r.startElection()
+		if state == Leader || elapsed < timeout {
+			continue
 		}
+		if r.preVote() {
+			r.startElection()
+		} else {
+			// Not enough peers think the leader is gone. Wait another full
+			// timeout before asking again rather than hammering them.
+			r.mu.Lock()
+			r.lastHeartbeatSeen = time.Now()
+			r.mu.Unlock()
+		}
+		timeout = randomElectionTimeout()
 	}
 }
 
+// preVote asks peers "would you vote for me if I started an election?"
+// WITHOUT incrementing this node's term. Peers that heard from a live
+// leader within electionTimeoutMin say no. This stops a node that was
+// briefly unreachable (e.g. a freshly restarted pod whose peers still have
+// a stale DNS entry for it) from bumping the term and forcing a healthy
+// leader to step down, which would cause a second, avoidable outage.
+func (r *Raft) preVote() bool {
+	r.mu.Lock()
+	if r.state == Leader {
+		r.mu.Unlock()
+		return false
+	}
+	lastIdx, lastTerm := r.lastLogIndexTerm()
+	args := RequestVoteArgs{
+		Term:         r.currentTerm + 1,
+		CandidateID:  r.id,
+		LastLogIndex: lastIdx,
+		LastLogTerm:  lastTerm,
+		PreVote:      true,
+	}
+	r.mu.Unlock()
+	return r.collectVotes(args)
+}
+
 // startElection transitions to Candidate, votes for itself, and requests
-// votes from every peer in parallel. If it wins a majority (quorum) before
-// the term changes, it becomes Leader.
+// votes from every peer in parallel. It becomes Leader as soon as a quorum
+// says yes, without waiting on slow or dead peers.
 func (r *Raft) startElection() {
 	r.mu.Lock()
+	if r.state == Leader {
+		r.mu.Unlock()
+		return
+	}
 	r.state = Candidate
 	r.currentTerm++
 	term := r.currentTerm
@@ -238,65 +337,118 @@ func (r *Raft) startElection() {
 	if r.metrics != nil {
 		r.metrics.IncElectionsStarted()
 	}
-
 	log.Printf("[%s] term=%d starting election, need quorum=%d/%d", r.id, term, r.quorum(), len(r.peers)+1)
 
-	votes := 1 // vote for self
-	var voteMu sync.Mutex
-	var wg sync.WaitGroup
-
-	for _, peer := range r.peers {
-		wg.Add(1)
-		go func(peer string) {
-			defer wg.Done()
-			reply, err := r.transport.SendRequestVote(peer, RequestVoteArgs{
-				Term:         term,
-				CandidateID:  r.id,
-				LastLogIndex: lastIdx,
-				LastLogTerm:  lastTerm,
-			})
-			if err != nil {
-				return
-			}
-			r.mu.Lock()
-			if reply.Term > r.currentTerm {
-				r.becomeFollower(reply.Term, "")
-				r.mu.Unlock()
-				return
-			}
-			r.mu.Unlock()
-
-			if reply.VoteGranted {
-				voteMu.Lock()
-				votes++
-				voteMu.Unlock()
-			}
-		}(peer)
-	}
-	wg.Wait()
+	won := r.collectVotes(RequestVoteArgs{
+		Term:         term,
+		CandidateID:  r.id,
+		LastLogIndex: lastIdx,
+		LastLogTerm:  lastTerm,
+	})
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.state == Candidate && r.currentTerm == term && votes >= r.quorum() {
+	if won && r.state == Candidate && r.currentTerm == term {
 		r.becomeLeader()
 	}
+}
+
+// collectVotes sends a (pre-)vote request to every peer in parallel and
+// returns true the moment a quorum (counting self) has granted it, or
+// false once every peer has answered or failed without reaching one.
+func (r *Raft) collectVotes(args RequestVoteArgs) bool {
+	need := r.quorum()
+	votes := 1 // self
+	if votes >= need {
+		return true
+	}
+	results := make(chan bool, len(r.peers)) // buffered: stragglers never block after we return
+	for _, peer := range r.peers {
+		go func(peer string) {
+			reply, err := r.transport.SendRequestVote(peer, args)
+			if err != nil {
+				results <- false
+				return
+			}
+			if !args.PreVote && reply.Term > args.Term {
+				r.mu.Lock()
+				if reply.Term > r.currentTerm {
+					r.becomeFollower(reply.Term, "")
+				}
+				r.mu.Unlock()
+			}
+			results <- reply.VoteGranted
+		}(peer)
+	}
+	for range r.peers {
+		if <-results {
+			votes++
+			if votes >= need {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // becomeLeader must be called with r.mu held.
 func (r *Raft) becomeLeader() {
 	r.state = Leader
 	r.leaderID = r.id
-	log.Printf("[%s] *** ELECTED LEADER *** term=%d votes>=quorum", r.id, r.currentTerm)
+	if !r.lastLeaderContact.IsZero() {
+		r.lastFailover = time.Since(r.lastLeaderContact)
+		log.Printf("[%s] *** ELECTED LEADER *** term=%d failover=%dms (since last contact with previous leader)",
+			r.id, r.currentTerm, r.lastFailover.Milliseconds())
+	} else {
+		log.Printf("[%s] *** ELECTED LEADER *** term=%d (initial election)", r.id, r.currentTerm)
+	}
 	if r.metrics != nil {
 		r.metrics.IncElectionsWon()
 	}
 
+	// Append a no-op in the new term. Raft only lets a leader commit
+	// entries from its OWN term (Figure 8 in the paper), so without this,
+	// writes accepted by the previous leader but not yet committed would
+	// sit in limbo until the next client write happened to arrive.
+	r.log = append(r.log, LogEntry{Term: r.currentTerm, Index: len(r.log), Command: Command{Op: "NOOP"}})
+	r.flushLogLocked()
+
 	lastIdx, _ := r.lastLogIndexTerm()
+	r.replicateC = make(map[string]chan struct{}, len(r.peers))
 	for _, p := range r.peers {
-		r.nextIndex[p] = lastIdx + 1
+		r.nextIndex[p] = lastIdx // probe from the entry before the no-op
 		r.matchIndex[p] = 0
+		r.lastAck[p] = time.Now() // grace period: they just voted for us
+		ch := make(chan struct{}, 1)
+		r.replicateC[p] = ch
+		go r.replicator(p, r.currentTerm, ch)
+		kick(ch) // announce leadership immediately instead of after the first heartbeat tick
 	}
-	go r.leaderHeartbeatLoop(r.currentTerm)
+	r.advanceCommitIndexLocked() // single-node cluster commits the no-op right away
+}
+
+// checkQuorumLocked makes a leader step down if it hasn't had a successful
+// reply from a majority within electionTimeoutMax. A leader cut off from
+// the cluster (network partition, or the rest of the cluster moved on)
+// would otherwise keep accepting writes it can never commit, holding each
+// client until its proposeTimeout. Stepping down fails those writes fast,
+// so the API layer retries them on the real leader. r.mu must be held.
+func (r *Raft) checkQuorumLocked() {
+	acks := 1 // self
+	for _, p := range r.peers {
+		if time.Since(r.lastAck[p]) < electionTimeoutMax {
+			acks++
+		}
+	}
+	if acks >= r.quorum() {
+		return
+	}
+	log.Printf("[%s] term=%d lost contact with a quorum (%d/%d reachable), stepping down", r.id, r.currentTerm, acks, len(r.peers)+1)
+	// Same term: keep votedFor as-is, or this node could vote twice in one term.
+	r.state = Follower
+	r.leaderID = ""
+	r.lastHeartbeatSeen = time.Now()
+	r.notifyLocked()
 }
 
 // becomeFollower must be called with r.mu held.
@@ -307,110 +459,150 @@ func (r *Raft) becomeFollower(term int, leaderID string) {
 	r.state = Follower
 	r.currentTerm = term
 	r.votedFor = ""
-	if leaderID != "" {
-		r.leaderID = leaderID
-	}
+	// Overwrite even with "": after a term change the old leader is no
+	// longer valid, and pointing clients at it would just fail.
+	r.leaderID = leaderID
 	r.lastHeartbeatSeen = time.Now()
 	r.persistMetaLocked()
+	r.notifyLocked()
 }
 
-// leaderHeartbeatLoop periodically sends AppendEntries (heartbeat or real
-// replication) to every peer while this node remains leader for `term`.
-func (r *Raft) leaderHeartbeatLoop(term int) {
-	ticker := time.NewTicker(400 * time.Millisecond)
+// flushLogLocked durably writes every not-yet-persisted entry in ONE
+// Postgres transaction. Many concurrent Propose calls append to the
+// in-memory log and then each call this. Whichever gets the lock first
+// writes the whole pending batch, and the rest find their entries already
+// persisted. That turns N client writes into ~1 database round trip
+// (group commit), which is what makes 500 concurrent writers workable.
+// r.mu must be held; holding it keeps the write ordered with any log
+// truncation from a new leader.
+func (r *Raft) flushLogLocked() {
+	if r.persistedIndex >= len(r.log)-1 {
+		return
+	}
+	if r.storage != nil {
+		if err := r.storage.AppendLog(r.log[r.persistedIndex+1:]); err != nil {
+			log.Printf("[%s] WARNING: failed to persist log entries: %v", r.id, err)
+			return // not durable: don't count ourselves toward quorum for these
+		}
+	}
+	r.persistedIndex = len(r.log) - 1
+}
+
+// replicator is the one goroutine per peer that the leader uses to talk to
+// that peer for a single term. It sends whenever new entries are proposed
+// (trigger) or at least every heartbeatInterval. Exactly one RPC per peer
+// is in flight at a time, so a dead or slow peer only delays itself: the
+// healthy peers keep getting heartbeats on schedule.
+func (r *Raft) replicator(peer string, term int, trigger chan struct{}) {
+	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		r.mu.Lock()
-		if r.state != Leader || r.currentTerm != term {
-			r.mu.Unlock()
+	for {
+		for {
+			more, ok := r.replicateToPeer(peer, term)
+			if !ok || !more {
+				break
+			}
+		}
+		if !r.isLeaderFor(term) {
 			return
 		}
-		r.mu.Unlock()
-		r.replicateToAllPeers(term)
+		select {
+		case <-trigger:
+		case <-ticker.C:
+		}
 	}
 }
 
-func (r *Raft) replicateToAllPeers(term int) {
-	var wg sync.WaitGroup
-	for _, peer := range r.peers {
-		wg.Add(1)
-		go func(peer string) {
-			defer wg.Done()
-			r.replicateToPeer(peer, term)
-		}(peer)
-	}
-	wg.Wait()
-	r.advanceCommitIndex(term)
+func (r *Raft) isLeaderFor(term int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state == Leader && r.currentTerm == term
 }
 
-func (r *Raft) replicateToPeer(peer string, term int) {
+// replicateToPeer sends one AppendEntries (a heartbeat if the peer is
+// caught up). Returns more=true if the peer is still behind and another
+// RPC should go out immediately, ok=false if the RPC failed.
+func (r *Raft) replicateToPeer(peer string, term int) (more, ok bool) {
 	r.mu.Lock()
 	if r.state != Leader || r.currentTerm != term {
 		r.mu.Unlock()
-		return
+		return false, false
 	}
 	ni := r.nextIndex[peer]
 	if ni < 1 {
 		ni = 1
 	}
-	prevIdx := ni - 1
-	prevTerm := 0
-	if prevIdx < len(r.log) && prevIdx >= 0 {
-		prevTerm = r.log[prevIdx].Term
+	if ni > len(r.log) {
+		ni = len(r.log)
 	}
-	var entries []LogEntry
-	if ni < len(r.log) {
-		entries = append(entries, r.log[ni:]...)
+	prevIdx := ni - 1
+	end := len(r.log)
+	if end-ni > maxEntriesPerRPC {
+		end = ni + maxEntriesPerRPC
 	}
 	args := AppendEntriesArgs{
 		Term:         term,
 		LeaderID:     r.id,
 		PrevLogIndex: prevIdx,
-		PrevLogTerm:  prevTerm,
-		Entries:      entries,
+		PrevLogTerm:  r.log[prevIdx].Term,
+		Entries:      append([]LogEntry(nil), r.log[ni:end]...),
 		LeaderCommit: r.commitIndex,
 	}
 	r.mu.Unlock()
 
 	reply, err := r.transport.SendAppendEntries(peer, args)
 	if err != nil {
-		return
+		return false, false
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if reply.Term > r.currentTerm {
 		r.becomeFollower(reply.Term, "")
-		return
+		return false, false
 	}
 	if r.state != Leader || r.currentTerm != term {
-		return
+		return false, false
 	}
+	r.lastAck[peer] = time.Now() // any same-term reply proves the peer still follows us
 	if reply.Success {
-		r.matchIndex[peer] = prevIdx + len(entries)
-		r.nextIndex[peer] = r.matchIndex[peer] + 1
-	} else {
-		if r.nextIndex[peer] > 1 {
-			r.nextIndex[peer]--
+		if match := prevIdx + len(args.Entries); match > r.matchIndex[peer] {
+			r.matchIndex[peer] = match
 		}
+		r.nextIndex[peer] = r.matchIndex[peer] + 1
+		r.advanceCommitIndexLocked()
+		return r.nextIndex[peer] < len(r.log), true
 	}
+	// Log mismatch: back up. The follower tells us its last index, so we
+	// can jump straight there instead of decrementing one entry per RPC.
+	next := ni - 1
+	if hint := reply.LastLogIndex + 1; hint < next {
+		next = hint
+	}
+	if next < 1 {
+		next = 1
+	}
+	r.nextIndex[peer] = next
+	return true, true
 }
 
-// advanceCommitIndex checks, for each un-committed index, whether a QUORUM
-// of matchIndex[] values have reached it. This is the heart of "quorum
+// advanceCommitIndexLocked checks, for each un-committed index, whether a
+// QUORUM of nodes have durably stored it. This is the heart of "quorum
 // consensus": an entry is only safe to apply once a majority of the
-// cluster has durably replicated it.
-func (r *Raft) advanceCommitIndex(term int) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.state != Leader || r.currentTerm != term {
+// cluster has it. The leader only counts itself once its own Postgres
+// write for that entry has landed. r.mu must be held.
+func (r *Raft) advanceCommitIndexLocked() {
+	if r.state != Leader {
 		return
 	}
 	for n := len(r.log) - 1; n > r.commitIndex; n-- {
 		if r.log[n].Term != r.currentTerm {
-			continue // Raft safety: never commit entries from older terms directly
+			break // Raft safety: never commit entries from older terms directly (and every lower index is older still)
 		}
-		count := 1 // leader itself has the entry
+		count := 0
+		if r.persistedIndex >= n {
+			count = 1
+		}
 		for _, p := range r.peers {
 			if r.matchIndex[p] >= n {
 				count++
@@ -418,18 +610,15 @@ func (r *Raft) advanceCommitIndex(term int) {
 		}
 		if count >= r.quorum() {
 			r.commitIndex = n
-			r.persistMetaLocked()
-			select {
-			case r.applyCh <- struct{}{}:
-			default:
-			}
-			break
+			kick(r.applyCh)
+			return
 		}
 	}
 }
 
 // applyLoop applies committed-but-not-yet-applied entries to the state
-// machine, in order.
+// machine, in order, then records progress in Postgres once per batch
+// (not once per entry) and wakes any Propose callers waiting on them.
 func (r *Raft) applyLoop() {
 	for range r.applyCh {
 		r.mu.Lock()
@@ -440,14 +629,26 @@ func (r *Raft) applyLoop() {
 			r.store.Apply(entry.Command)
 			r.mu.Lock()
 		}
+		if r.storage != nil && r.lastApplied > r.persistedCommit {
+			if err := r.storage.SaveMeta(r.currentTerm, r.votedFor, r.lastApplied); err != nil {
+				log.Printf("[%s] WARNING: failed to persist commit index: %v", r.id, err)
+			} else {
+				r.persistedCommit = r.lastApplied
+			}
+		}
+		r.notifyLocked()
 		r.mu.Unlock()
 	}
 }
 
 // Propose is called on the leader to append a new command to the log and
 // replicate it. It blocks until the entry is applied to the state machine
-// (i.e. committed by quorum) or a timeout elapses. Returns an error if
-// this node isn't the leader.
+// (i.e. committed by quorum) or a timeout elapses.
+//
+// Errors: *NotLeaderError means nothing was written and the caller may
+// safely retry on the real leader. *LeadershipLostError and *TimeoutError
+// mean the entry was appended but its fate is unknown (it may still
+// commit), so blindly retrying could apply it twice.
 func (r *Raft) Propose(cmd Command) (int, error) {
 	r.mu.Lock()
 	if r.state != Leader {
@@ -458,63 +659,100 @@ func (r *Raft) Propose(cmd Command) (int, error) {
 		}
 		return 0, &NotLeaderError{LeaderID: leader}
 	}
-	entry := LogEntry{
-		Term:    r.currentTerm,
-		Index:   len(r.log),
-		Command: cmd,
-	}
-	r.log = append(r.log, entry)
-	if r.storage != nil {
-		if err := r.storage.AppendLog([]LogEntry{entry}); err != nil {
-			log.Printf("[%s] WARNING: failed to persist log entry: %v", r.id, err)
-		}
-	}
 	term := r.currentTerm
-	idx := entry.Index
+	idx := len(r.log)
+	r.log = append(r.log, LogEntry{Term: term, Index: idx, Command: cmd})
+	triggers := make([]chan struct{}, 0, len(r.replicateC))
+	for _, ch := range r.replicateC {
+		triggers = append(triggers, ch)
+	}
 	r.mu.Unlock()
 
-	// Trigger immediate replication instead of waiting for the next
-	// heartbeat tick, then poll briefly for commit + apply.
-	r.replicateToAllPeers(term)
+	// Ship to followers in parallel with our own disk write (allowed by
+	// Raft: the leader just can't count itself until its write lands).
+	for _, ch := range triggers {
+		kick(ch)
+	}
+	r.mu.Lock()
+	if r.state == Leader && r.currentTerm == term {
+		r.flushLogLocked()
+		r.advanceCommitIndexLocked()
+	}
+	r.mu.Unlock()
 
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
+	timer := time.NewTimer(proposeTimeout)
+	defer timer.Stop()
+	for {
 		r.mu.Lock()
-		applied := r.lastApplied >= idx && r.state == Leader && r.currentTerm == term
-		stillLeader := r.state == Leader
-		r.mu.Unlock()
-		if applied {
-			if r.metrics != nil {
-				r.metrics.IncProposalsSucceeded()
+		if r.lastApplied >= idx {
+			ours := r.log[idx].Term == term
+			r.mu.Unlock()
+			if ours {
+				if r.metrics != nil {
+					r.metrics.IncProposalsSucceeded()
+				}
+				return idx, nil
 			}
-			return idx, nil
-		}
-		if !stillLeader {
 			if r.metrics != nil {
 				r.metrics.IncProposalsFailed()
 			}
-			return 0, &NotLeaderError{LeaderID: ""}
+			return 0, &LeadershipLostError{}
 		}
-		time.Sleep(10 * time.Millisecond)
+		if r.state != Leader || r.currentTerm != term {
+			r.mu.Unlock()
+			if r.metrics != nil {
+				r.metrics.IncProposalsFailed()
+			}
+			return 0, &LeadershipLostError{}
+		}
+		wake := r.appliedCh
+		r.mu.Unlock()
+
+		select {
+		case <-wake:
+		case <-timer.C:
+			if r.metrics != nil {
+				r.metrics.IncProposalsFailed()
+			}
+			return 0, &TimeoutError{}
+		}
 	}
-	if r.metrics != nil {
-		r.metrics.IncProposalsFailed()
-	}
-	return 0, &TimeoutError{}
 }
 
 type NotLeaderError struct{ LeaderID string }
 
 func (e *NotLeaderError) Error() string { return "not leader" }
 
+type LeadershipLostError struct{}
+
+func (e *LeadershipLostError) Error() string {
+	return "leadership changed before the write committed; outcome unknown"
+}
+
 type TimeoutError struct{}
 
 func (e *TimeoutError) Error() string { return "commit timeout waiting for quorum" }
 
-// HandleRequestVote implements the RequestVote RPC (receiver side).
+// HandleRequestVote implements the RequestVote RPC (receiver side),
+// including pre-vote requests.
 func (r *Raft) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if args.PreVote {
+		// Answer the hypothetical without changing any of our own state.
+		reply := RequestVoteReply{Term: r.currentTerm}
+		if args.Term < r.currentTerm || r.state == Leader {
+			return reply
+		}
+		if r.leaderID != "" && time.Since(r.lastLeaderContact) < electionTimeoutMin {
+			return reply // our leader is alive as far as we can tell
+		}
+		lastIdx, lastTerm := r.lastLogIndexTerm()
+		reply.VoteGranted = args.LastLogTerm > lastTerm ||
+			(args.LastLogTerm == lastTerm && args.LastLogIndex >= lastIdx)
+		return reply
+	}
 
 	if args.Term > r.currentTerm {
 		r.becomeFollower(args.Term, "")
@@ -548,7 +786,7 @@ func (r *Raft) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	if args.Term > r.currentTerm {
 		r.becomeFollower(args.Term, args.LeaderID)
 	}
-	reply := AppendEntriesReply{Term: r.currentTerm}
+	reply := AppendEntriesReply{Term: r.currentTerm, LastLogIndex: len(r.log) - 1}
 
 	if args.Term < r.currentTerm {
 		reply.Success = false
@@ -556,47 +794,61 @@ func (r *Raft) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	}
 
 	// Valid leader for our term: reset election timer, acknowledge leadership.
-	r.state = Follower
+	if r.state != Follower {
+		r.state = Follower
+		r.notifyLocked()
+	}
 	r.leaderID = args.LeaderID
-	r.lastHeartbeatSeen = time.Now()
+	now := time.Now()
+	r.lastHeartbeatSeen = now
+	r.lastLeaderContact = now
 
 	if args.PrevLogIndex >= len(r.log) || r.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
+		if args.PrevLogIndex < len(r.log) {
+			reply.LastLogIndex = args.PrevLogIndex - 1 // our entry there conflicts too
+		}
 		return reply
 	}
 
-	// Append new entries, truncating any conflicting suffix.
+	// Skip entries we already have; find the first new or conflicting one.
 	insertAt := args.PrevLogIndex + 1
-	logChanged := false
-	for i, e := range args.Entries {
+	i := 0
+	for ; i < len(args.Entries); i++ {
 		idx := insertAt + i
-		if idx < len(r.log) {
-			if r.log[idx].Term != e.Term {
-				r.log = r.log[:idx]
-				r.log = append(r.log, args.Entries[i:]...)
-				logChanged = true
-				if r.storage != nil {
-					if err := r.storage.TruncateLogFrom(idx); err != nil {
-						log.Printf("[%s] WARNING: failed to persist truncate: %v", r.id, err)
-					}
-					if err := r.storage.AppendLog(args.Entries[i:]); err != nil {
-						log.Printf("[%s] WARNING: failed to persist appended entries: %v", r.id, err)
-					}
-				}
-				break
-			}
-		} else {
-			r.log = append(r.log, args.Entries[i:]...)
-			logChanged = true
-			if r.storage != nil {
-				if err := r.storage.AppendLog(args.Entries[i:]); err != nil {
-					log.Printf("[%s] WARNING: failed to persist appended entries: %v", r.id, err)
-				}
-			}
+		if idx >= len(r.log) || r.log[idx].Term != args.Entries[i].Term {
 			break
 		}
 	}
-	_ = logChanged
+	if i < len(args.Entries) {
+		idx := insertAt + i
+		newEntries := args.Entries[i:]
+		if r.storage != nil {
+			// Durable BEFORE we acknowledge, or the leader could count a
+			// vote toward quorum for an entry that vanishes on our crash.
+			var err error
+			if idx < len(r.log) {
+				err = r.storage.TruncateLogFrom(idx)
+			}
+			if err == nil {
+				err = r.storage.AppendLog(newEntries)
+			}
+			if err != nil {
+				log.Printf("[%s] WARNING: failed to persist appended entries: %v", r.id, err)
+				if idx < len(r.log) {
+					r.log = r.log[:idx]
+				}
+				if r.persistedIndex > len(r.log)-1 {
+					r.persistedIndex = len(r.log) - 1
+				}
+				reply.LastLogIndex = len(r.log) - 1
+				reply.Success = false
+				return reply
+			}
+		}
+		r.log = append(r.log[:idx], newEntries...)
+		r.persistedIndex = len(r.log) - 1
+	}
 
 	if args.LeaderCommit > r.commitIndex {
 		lastNew := args.PrevLogIndex + len(args.Entries)
@@ -605,42 +857,41 @@ func (r *Raft) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 		} else {
 			r.commitIndex = lastNew
 		}
-		r.persistMetaLocked()
-		select {
-		case r.applyCh <- struct{}{}:
-		default:
-		}
+		kick(r.applyCh)
 	}
 
+	reply.LastLogIndex = len(r.log) - 1
 	reply.Success = true
 	return reply
 }
 
 // Status is a snapshot used by the /status HTTP endpoint.
 type Status struct {
-	ID          string `json:"id"`
-	State       string `json:"state"`
-	Term        int    `json:"term"`
-	LeaderID    string `json:"leader_id"`
-	CommitIndex int    `json:"commit_index"`
-	LogLength   int    `json:"log_length"`
-	Peers       int    `json:"peers"`
-	Quorum      int    `json:"quorum_size"`
-	Persistent  bool   `json:"persistent_storage"`
+	ID             string `json:"id"`
+	State          string `json:"state"`
+	Term           int    `json:"term"`
+	LeaderID       string `json:"leader_id"`
+	CommitIndex    int    `json:"commit_index"`
+	LogLength      int    `json:"log_length"`
+	Peers          int    `json:"peers"`
+	Quorum         int    `json:"quorum_size"`
+	Persistent     bool   `json:"persistent_storage"`
+	LastFailoverMs int64  `json:"last_failover_ms"` // set on a node that won an election after a previous leader failed
 }
 
 func (r *Raft) GetStatus() Status {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return Status{
-		ID:          r.id,
-		State:       r.state.String(),
-		Term:        r.currentTerm,
-		LeaderID:    r.leaderID,
-		CommitIndex: r.commitIndex,
-		LogLength:   len(r.log),
-		Peers:       len(r.peers),
-		Quorum:      r.quorum(),
-		Persistent:  r.storage != nil,
+		ID:             r.id,
+		State:          r.state.String(),
+		Term:           r.currentTerm,
+		LeaderID:       r.leaderID,
+		CommitIndex:    r.commitIndex,
+		LogLength:      len(r.log),
+		Peers:          len(r.peers),
+		Quorum:         r.quorum(),
+		Persistent:     r.storage != nil,
+		LastFailoverMs: r.lastFailover.Milliseconds(),
 	}
 }
